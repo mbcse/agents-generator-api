@@ -58,9 +58,17 @@ Always include:
 - At least 1 client config
 - settings.secrets for activated features
 
+### IMPORTANT: ENSURE COMPLETE AND VALID JSON
+- Your output MUST be complete, valid JSON that matches the schema
+- Do not truncate or leave any fields incomplete
+- Verify all opening brackets have matching closing brackets
+- Ensure all quotes and commas are properly placed
+- Double-check that all required fields are present and valid
 
 ### FORMAT INSTRUCTIONS:
 {formatInstructions}
+
+Note : If there is no info to create a character file and you just want to reply still create a dummy character file to avoid parsing error.
 
 `
 );
