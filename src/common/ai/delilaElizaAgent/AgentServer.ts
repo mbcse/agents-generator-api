@@ -6,10 +6,23 @@ import { EmbeddingConfig, EmbeddingManager, EmbeddingProvider } from "../Embeddi
 import { VectorStoreConfig, VectorStoreManager } from "../VectorStoreManager";
 import { RunnableSequence } from "@langchain/core/runnables";
 import { elizaCharacterGeneratorSystemPrompt } from "../systemPromtTemplates/elizaCharacterGeneratorSystemPromt";
+import { elizaReplyGeneratorSystemPrompt } from "../systemPromtTemplates/elizaReplyGeneratorSystemPrompt";
 import { z } from "zod";
 import { characterJsonSchema, CharacterSchema } from "./characterConfig";
-import { IterableReadableStream } from '@langchain/core/dist/utils/stream';
+import { IterableReadableStream } from '@langchain/core/utils/stream';
 
+// Define types for the response streams
+export type ReplyResponse = {
+  type: 'reply';
+  content: string;
+};
+
+export type CharacterFileResponse = {
+  type: 'characterFile';
+  content: any;
+};
+
+export type CombinedResponse = ReplyResponse | CharacterFileResponse;
 
 export class ElizaGeneratorAgent {
   private llm: LLMModelManager;
@@ -23,92 +36,175 @@ export class ElizaGeneratorAgent {
     this.vectorStore = new VectorStoreManager(vectorStoreConfig, this.embedder.getEmbedder());
   }
 
-  public async generateCharacterFile(sessionId: string, userMessage: string): Promise<IterableReadableStream<any>> {
-    await this.vectorStore.init();
-    // Store message in session history
-    if (!this.sessionMessages.has(sessionId)) {
-      this.sessionMessages.set(sessionId, []);
+  /**
+   * Initialize the agent and prepare session data
+   * @param sessionId Unique session identifier
+   * @param userMessage The user's message
+   * @returns Object containing message history and context
+   */
+  public async initializeSession(sessionId: string, userMessage: string): Promise<{ messageHistory: string, context: string }> {
+    console.log(`[START] initializeSession - Session ID: ${sessionId}`);
+    
+    try {
+      console.log(`[STEP 1] Initializing vector store`);
+      await this.vectorStore.init();
+      console.log(`[STEP 1] Vector store initialized successfully`);
+      
+      // Store message in session history
+      console.log(`[STEP 2] Managing session messages`);
+      if (!this.sessionMessages.has(sessionId)) {
+        console.log(`[STEP 2] Creating new session for ID: ${sessionId}`);
+        this.sessionMessages.set(sessionId, []);
+      } else {
+        console.log(`[STEP 2] Using existing session for ID: ${sessionId} with ${this.sessionMessages.get(sessionId)?.length || 0} messages`);
+      }
+
+      console.log(`[STEP 3] Processing user message: "${userMessage}"`);
+      const currentMessage = new HumanMessage(userMessage);
+      this.sessionMessages.get(sessionId)?.push(currentMessage);
+      console.log(`[STEP 3] Added message to session history. Total messages: ${this.sessionMessages.get(sessionId)?.length || 0}`);
+
+      // Fetch relevant context from vector store
+      console.log(`[STEP 4] Fetching relevant context from vector store`);
+      const relevantDocs = await this.vectorStore.getVectorStore().similaritySearch(userMessage, 3);
+      console.log(`[STEP 4] Found ${relevantDocs.length} relevant documents`);
+      
+      const context = relevantDocs.map(doc => doc.pageContent).join('\n');
+      console.log(`[STEP 4] Context length: ${context.length} characters`);
+      
+      if (relevantDocs.length > 0) {
+        console.log(`[STEP 4] First document metadata:`, relevantDocs[0].metadata);
+      }
+
+      // Create message history string
+      console.log(`[STEP 5] Creating message history string`);
+      const messageHistory = this.sessionMessages.get(sessionId)
+        ?.map(msg => msg.content)
+        .join('\n') || '';
+      console.log(`[STEP 5] Message history length: ${messageHistory.length} characters`);
+
+      return { messageHistory, context };
+    } catch (error) {
+      console.error(`[ERROR] Exception in initializeSession:`, error);
+      throw error;
     }
-    const currentMessage = new HumanMessage(userMessage);
-    this.sessionMessages.get(sessionId)?.push(currentMessage);
+  }
 
-    // Fetch relevant context from vector store
-    const relevantDocs = await this.vectorStore.getVectorStore().similaritySearch(userMessage, 3);
-    const context = relevantDocs.map(doc => doc.pageContent).join('\n');
+  /**
+   * Generate a conversational reply to the user's message
+   * @param sessionId Unique session identifier
+   * @param userMessage The user's message
+   * @param messageHistory Previous conversation history
+   * @param context Relevant context from vector store
+   * @returns Stream of reply chunks
+   */
+  public async generateReply(sessionId: string, userMessage: string, messageHistory: string, context: string): Promise<IterableReadableStream<any>> {
+    console.log(`[REPLY] Generating reply for session ${sessionId}`);
 
-    // Create message history string
-    const messageHistory = this.sessionMessages.get(sessionId)
-      ?.map(msg => msg.content)
-      .join('\n') || '';
-
-      // Create a combined schema for character file and reply message
-      const CombinedResponseSchema = z.object({
-        characterFile: CharacterSchema,
-        replyMessage: z.string()
-      });
-
-      const parser = StructuredOutputParser.fromZodSchema(
-        CombinedResponseSchema
-      );
-
-      // console.log(parser.getFormatInstructions());
-
-
-
-    const agentChain = RunnableSequence.from([
+    console.log(messageHistory);
+    
+    // Create a parser for the reply
+    const ReplySchema = z.object({
+      reply: z.string()
+    });
+    
+    const replyParser = StructuredOutputParser.fromZodSchema(ReplySchema);
+    
+    // Create the reply chain
+    const replyChain = RunnableSequence.from([
       {
         messageHistory: (input) => messageHistory,
         context: (input) => context,
-        characterJsonSchema: (input) => characterJsonSchema,
-        formatInstructions: (input) => parser.getFormatInstructions(),
+        formatInstructions: (input) => replyParser.getFormatInstructions(),
       },
-      elizaCharacterGeneratorSystemPrompt,
+      elizaReplyGeneratorSystemPrompt,
       this.llm.getModel(),
-      parser
+      replyParser
     ]);
-
-    // Stream the response
-    const stream = await agentChain.stream(userMessage);
-    let fullResponse = '';
-    let parsedResponse: any = null;
     
-    // for await (const chunk of stream) {
-    //   // Accumulate the response
-    //   if (typeof chunk === 'object') {
-    //     parsedResponse = chunk;
-    //   } else {
-    //     fullResponse += chunk;
-    //   }
-    // }
-
-    return stream;
-
-    // try {
-    //   // console.log("Full response:", fullResponse);
-    //   // console.log("Parsed response:", parsedResponse);
+    console.log(`[REPLY] Reply chain created, starting stream`);
+    return replyChain.stream(userMessage);
+  }
+  
+  /**
+   * Generate a character file based on the conversation
+   * @param sessionId Unique session identifier
+   * @param userMessage The user's message
+   * @param messageHistory Previous conversation history
+   * @param context Relevant context from vector store
+   * @returns Stream of character file chunks
+   */
+  public async generateCharacterFile(sessionId: string, userMessage: string, messageHistory: string, context: string): Promise<IterableReadableStream<any>> {
+    console.log(`[CHARACTER] Generating character file for session ${sessionId}`);
+    
+    try {
+      // Create a parser for the character file
+      const parser = StructuredOutputParser.fromZodSchema(CharacterSchema);
       
-    //   // If we have a parsed response object, use it directly
-    //   if (parsedResponse && parsedResponse.characterFile && parsedResponse.replyMessage) {
-    //     return {
-    //       characterFile: parsedResponse.characterFile,
-    //       reply: parsedResponse.replyMessage
-    //     };
-    //   }
+      // Create the character file chain
+      const characterChain = RunnableSequence.from([
+        {
+          messageHistory: (input) => messageHistory,
+          context: (input) => context,
+          characterJsonSchema: (input) => characterJsonSchema,
+          formatInstructions: (input) => parser.getFormatInstructions(),
+        },
+        elizaCharacterGeneratorSystemPrompt,
+        this.llm.getModel(),
+        parser
+      ]);
       
-      // // Otherwise try to parse the string response
-      // const jsonResponse = JSON.parse(fullResponse);
-      // return {
-      //   characterFile: jsonResponse.characterFile,
-      //   reply: jsonResponse.replyMessage || "I've created a character file based on your requirements. Let me know if you'd like to make any adjustments!"
-      // };
-    // } catch (error) {
-    //   // console.error("Error parsing LLM response:", error);
-    //   // throw new Error('Failed to generate valid character file');
-    //   return{
-    //     characterFile: null,
-    //     reply: fullResponse
-    //   }
-    // }
+      console.log(`[CHARACTER] Character chain created, starting stream`);
+      return characterChain.stream(userMessage);
+    } catch (error) {
+      console.error(`[CHARACTER] Error setting up character file generation:`, error);
+      throw error;
+    }
+  }
+
+  // Process the stream in the background to log its contents
+  private async logStreamContents(stream: IterableReadableStream<any>): Promise<void> {
+    let chunkCount = 0;
+    let objectChunks = 0;
+    let stringChunks = 0;
+    let totalStringLength = 0;
+    
+    try {
+      console.log(`[STREAM_BG] Starting to process stream chunks in background`);
+      
+      // Create a clone of the stream to process in the background
+      const streamClone = stream[Symbol.asyncIterator]();
+      
+      // Process each chunk
+      while (true) {
+        const { value, done } = await streamClone.next();
+        
+        if (done) {
+          break;
+        }
+        
+        const chunk = value;
+        chunkCount++;
+        
+        if (typeof chunk === 'object') {
+          objectChunks++;
+          console.log(`[STREAM_BG] Chunk #${chunkCount} is an object:`, JSON.stringify(chunk));
+        } else {
+          stringChunks++;
+          totalStringLength += String(chunk).length;
+          console.log(`[STREAM_BG] Chunk #${chunkCount} is a string of length ${String(chunk).length}`);
+          if (String(chunk).length < 500) {
+            console.log(`[STREAM_BG] String content: "${String(chunk)}"`);
+          } else {
+            console.log(`[STREAM_BG] String content (truncated): "${String(chunk).substring(0, 200)}..."`);
+          }
+        }
+      }
+      
+      console.log(`[STREAM_BG] Stream completed. Total chunks: ${chunkCount} (${objectChunks} objects, ${stringChunks} strings, total string length: ${totalStringLength})`);
+    } catch (error) {
+      console.error(`[STREAM_BG] Error processing stream:`, error);
+    }
   }
 
   // Static factory method
@@ -117,6 +213,7 @@ export class ElizaGeneratorAgent {
     embeddingConfig: EmbeddingConfig,
     vectorStoreConfig: VectorStoreConfig
   ): Promise<ElizaGeneratorAgent> {
+    console.log(`[FACTORY] Creating new ElizaGeneratorAgent instance`);
     return new ElizaGeneratorAgent(modelConfig, embeddingConfig, vectorStoreConfig);
   }
 }
