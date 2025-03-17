@@ -14,7 +14,22 @@ export const ElizaResponseSchema = z.object({
 
 // Input Validation for 'GET users/:id' endpoint
 export const GetElizaRequestSchema = z.object({
-  content: z.object({
-    message: z.string()
-  })
+  messages: z.array(z.object({
+    content: z.string(),
+    role: z.enum(["user", "assistant"]).optional()
+  })),
+  sessionId: z.string().optional()
+});
+
+// Schema for session initialization
+export type InitSessionResponse = z.infer<typeof InitSessionResponseSchema>;
+export const InitSessionResponseSchema = z.object({
+  sessionId: z.string(),
+  message: z.string().optional()
+});
+
+// Schema for session initialization request
+export const InitSessionRequestSchema = z.object({
+  // Optional initial message to start the conversation
+  initialMessage: z.string().optional()
 });

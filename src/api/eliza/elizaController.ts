@@ -7,6 +7,7 @@ import { LLLModelConfig, LLMProviders } from "@/common/ai/LLMModelManager";
 import { EmbeddingConfig, EmbeddingProvider } from "@/common/ai/EmbeddingManager";
 import { VectorStoreConfig, VectorStoreProvider } from "@/common/ai/VectorStoreManager";
 import { LangChainAdapter } from 'ai';
+import { DatabaseService } from "@/database";
 
 const modelConfig: LLLModelConfig = {
   provider: LLMProviders.ANTHROPIC,
@@ -42,16 +43,86 @@ interface LLMError {
 }
 
 class ElizaController {
+  private db: DatabaseService;
+
+  constructor() {
+    this.db = DatabaseService.getInstance();
+  }
+
+  /**
+   * Initialize a new session
+   * @param req Request object
+   * @param res Response object
+   * @returns Session ID and optional welcome message
+   */
+  public initSession: RequestHandler = async (req: Request, res: Response) => {
+    try {
+      // Connect to the database
+      await this.db.connect();
+      
+      // Create a new session
+      const session = await this.db.sessions.createSession();
+      
+      // If an initial message was provided, store it
+      if (req.body.initialMessage) {
+        await this.db.messages.createMessage({
+          content: req.body.initialMessage,
+          role: 'user',
+          sessionId: session.id,
+        });
+      }
+      
+      // Return the session ID
+      return res.status(200).json({
+        sessionId: session.id,
+        message: "Session initialized successfully"
+      });
+    } catch (error) {
+      console.error("Error initializing session:", error);
+      return res.status(500).json({ 
+        error: "Failed to initialize session",
+        message: (error as Error).message || String(error)
+      });
+    }
+  };
+
   public chat: RequestHandler = async (req: Request, res: Response) => {
     try {
+      // Connect to the database
+      await this.db.connect();
+      
+      // Validate that the session ID is provided
+      if (!req.body.sessionId) {
+        return res.status(400).json({ 
+          error: "Session ID is required",
+          message: "Please initialize a session first using the /init-session endpoint"
+        });
+      }
+      
+      // Check if the session exists
+      const sessionExists = await this.db.sessions.getSessionById(req.body.sessionId);
+      if (!sessionExists) {
+        return res.status(404).json({ 
+          error: "Session not found",
+          message: "The provided session ID does not exist"
+        });
+      }
+      
       const elizaAgentServer = await ElizaGeneratorAgent.create(modelConfig, embeddingConfig, vectorStoreConfig);
       console.log(req.body.messages);
       const message = req.body.messages[req.body.messages.length - 1].content;
       console.log(message);
       
+      // Store the user's message in the database
+      await this.db.messages.createMessage({
+        content: message,
+        role: 'user',
+        sessionId: req.body.sessionId,
+      });
+      
       // Initialize the session and get message history and context
-      const sessionId = "1234"; // In a real app, this would be a unique session ID
-      const { messageHistory, context } = await elizaAgentServer.initializeSession(sessionId, message);
+      const sessionId = req.body.sessionId;
+      const { messageHistory, context, sessionId: actualSessionId, characterFile } = await elizaAgentServer.initializeSession(sessionId, message);
       
       // Set up SSE headers
       res.setHeader('Content-Type', 'text/event-stream');
@@ -60,11 +131,20 @@ class ElizaController {
       
       // First, stream the reply
       console.log("Starting to stream reply...");
+      let fullReply = '';
+      
       try {
-        const replyStream = await elizaAgentServer.generateReply(sessionId, message, messageHistory, context);
+        const replyStream = await elizaAgentServer.generateReply(actualSessionId, message, messageHistory, context, characterFile);
         
+        console.log("Got reply stream, starting to iterate...");
         for await (const chunk of replyStream) {
-          console.log('Reply chunk:', chunk);
+          console.log('Reply chunk received:', JSON.stringify(chunk));
+          
+          // Accumulate the full reply for database storage
+          if (chunk.reply) {
+            fullReply += chunk.reply;
+          }
+          
           // Convert the chunk object to a string before writing to the response
           const replyContent = chunk.reply || chunk;
           const replyChunk = {
@@ -74,6 +154,16 @@ class ElizaController {
           const chunkString = JSON.stringify(replyChunk);
           // Format as SSE (Server-Sent Events)
           res.write(`data: ${chunkString}\n\n`);
+        }
+        
+        // Store the complete reply in the database
+        if (fullReply) {
+          await this.db.messages.createMessage({
+            content: fullReply,
+            role: 'assistant',
+            sessionId: actualSessionId,
+          });
+          console.log(`[CONTROLLER] Stored complete reply in database for session ${actualSessionId}`);
         }
       } catch (error) {
         const replyError = error as LLMError;
@@ -88,11 +178,20 @@ class ElizaController {
       
       // Then, stream the character file
       console.log("Starting to stream character file...");
+      let characterData: any = null;
+      
       try {
-        const characterFileStream = await elizaAgentServer.generateCharacterFile(sessionId, message, messageHistory, context);
+        const characterFileStream = await elizaAgentServer.generateCharacterFile(actualSessionId, message, messageHistory, context, characterFile);
         
+        console.log("Got character file stream, starting to iterate...");
         for await (const chunk of characterFileStream) {
-          console.log('Character file chunk:', chunk);
+          console.log('Character file chunk received:', JSON.stringify(chunk));
+          
+          // Store the complete character data
+          if (chunk) {
+            characterData = chunk;
+          }
+          
           // Convert the chunk object to a string before writing to the response
           const characterFileChunk = {
             type: 'characterFile',
@@ -101,6 +200,15 @@ class ElizaController {
           const chunkString = JSON.stringify(characterFileChunk);
           // Format as SSE (Server-Sent Events)
           res.write(`data: ${chunkString}\n\n`);
+        }
+        
+        // Store the character file in the database
+        if (characterData) {
+          await this.db.characterFiles.createCharacterFile({
+            content: characterData,
+            sessionId: actualSessionId,
+          });
+          console.log(`[CONTROLLER] Stored character file in database for session ${actualSessionId}`);
         }
       } catch (error) {
         const characterFileError = error as LLMError;

@@ -1,4 +1,6 @@
 import { StructuredOutputParser } from '@langchain/core/output_parsers';
+import { OutputFixingParser } from "langchain/output_parsers";
+
 import { HumanMessage } from "@langchain/core/messages";
 import { P } from "pino";
 import { LLLModelConfig, LLMModelManager, LLMProviders } from "../LLMModelManager";
@@ -10,6 +12,9 @@ import { elizaReplyGeneratorSystemPrompt } from "../systemPromtTemplates/elizaRe
 import { z } from "zod";
 import { characterJsonSchema, CharacterSchema } from "./characterConfig";
 import { IterableReadableStream } from '@langchain/core/utils/stream';
+import { DatabaseService } from '../../../database';
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
 
 // Define types for the response streams
 export type ReplyResponse = {
@@ -28,21 +33,30 @@ export class ElizaGeneratorAgent {
   private llm: LLMModelManager;
   private embedder: EmbeddingManager;
   private vectorStore: VectorStoreManager;
-  private sessionMessages: Map<string, HumanMessage[]> = new Map();
+  private db: DatabaseService;
 
   private constructor(modelConfig: LLLModelConfig, embeddingConfig: EmbeddingConfig, vectorStoreConfig: VectorStoreConfig) {
-    this.llm = LLMModelManager.getInstance(modelConfig);
+    // Enable tools by default for the LLM
+    const configWithTools: LLLModelConfig = {
+      ...modelConfig,
+      enableTools: true
+    };
+    
+    this.llm = LLMModelManager.getInstance(configWithTools);
     this.embedder = EmbeddingManager.getInstance(embeddingConfig);
     this.vectorStore = new VectorStoreManager(vectorStoreConfig, this.embedder.getEmbedder());
+    this.db = DatabaseService.getInstance();
+    
+    console.log(`[AGENT] Created ElizaGeneratorAgent with tools ${this.llm.areToolsEnabled() ? 'enabled' : 'disabled'}`);
   }
 
   /**
    * Initialize the agent and prepare session data
    * @param sessionId Unique session identifier
    * @param userMessage The user's message
-   * @returns Object containing message history and context
+   * @returns Object containing message history, context, and character file
    */
-  public async initializeSession(sessionId: string, userMessage: string): Promise<{ messageHistory: string, context: string }> {
+  public async initializeSession(sessionId: string, userMessage: string): Promise<{ messageHistory: string, context: string, sessionId: string, characterFile: any }> {
     console.log(`[START] initializeSession - Session ID: ${sessionId}`);
     
     try {
@@ -50,19 +64,27 @@ export class ElizaGeneratorAgent {
       await this.vectorStore.init();
       console.log(`[STEP 1] Vector store initialized successfully`);
       
-      // Store message in session history
-      console.log(`[STEP 2] Managing session messages`);
-      if (!this.sessionMessages.has(sessionId)) {
-        console.log(`[STEP 2] Creating new session for ID: ${sessionId}`);
-        this.sessionMessages.set(sessionId, []);
+      // Ensure database connection
+      await this.db.connect();
+      
+      // Get or create session
+      let session = await this.db.sessions.getSessionById(sessionId);
+      if (!session) {
+        console.log(`[STEP 2] Creating new session in database for ID: ${sessionId}`);
+        session = await this.db.sessions.createSession();
       } else {
-        console.log(`[STEP 2] Using existing session for ID: ${sessionId} with ${this.sessionMessages.get(sessionId)?.length || 0} messages`);
+        console.log(`[STEP 2] Found existing session in database for ID: ${sessionId}`);
       }
-
+      
+      // Store message in database
       console.log(`[STEP 3] Processing user message: "${userMessage}"`);
-      const currentMessage = new HumanMessage(userMessage);
-      this.sessionMessages.get(sessionId)?.push(currentMessage);
-      console.log(`[STEP 3] Added message to session history. Total messages: ${this.sessionMessages.get(sessionId)?.length || 0}`);
+      await this.db.messages.createMessage({
+        content: userMessage,
+        role: 'user',
+        sessionId: session.id,
+      });
+      
+      console.log(`[STEP 3] Added message to database`);
 
       // Fetch relevant context from vector store
       console.log(`[STEP 4] Fetching relevant context from vector store`);
@@ -76,14 +98,55 @@ export class ElizaGeneratorAgent {
         console.log(`[STEP 4] First document metadata:`, relevantDocs[0].metadata);
       }
 
-      // Create message history string
-      console.log(`[STEP 5] Creating message history string`);
-      const messageHistory = this.sessionMessages.get(sessionId)
-        ?.map(msg => msg.content)
-        .join('\n') || '';
+      // Create message history string from database (excluding the current message)
+      console.log(`[STEP 5] Creating message history string from database`);
+      const dbMessages = await this.db.messages.getMessagesBySessionId(session.id);
+      
+      // Remove the last message (current user message) from history
+      const previousMessages = dbMessages.slice(0, dbMessages.length);
+      
+      // Format message history as "User Message: content" or "Assistant Message: content"
+      const messageHistory = previousMessages.map(msg => {
+        const roleLabel = msg.role === 'user' ? 'User Message' : 'Assistant Message';
+        return `${roleLabel}: ${msg.content}`;
+      }).join('\n');
+      
       console.log(`[STEP 5] Message history length: ${messageHistory.length} characters`);
 
-      return { messageHistory, context };
+      // Fetch current character file from database
+      console.log(`[STEP 6] Fetching current character file from database`);
+      let characterFile = await this.db.characterFiles.getCharacterFileBySessionId(session.id);
+      if (!characterFile) {
+        console.log(`[STEP 6] No character file found, creating empty template`);
+        characterFile = {
+          name: "",
+          bio: [],
+          lore: [],
+          knowledge: [],
+          messageExamples: [],
+          postExamples: [],
+          topics: [],
+          style: {
+            all: [],
+            chat: [],
+            post: []
+          },
+          adjectives: [],
+          clients: [],
+          plugins: [],
+          modelProvider: "",
+          settings: {
+            secrets: {},
+            voice: {
+              model: "en_US-male-medium"
+            }
+          }
+        };
+      } else {
+        console.log(`[STEP 6] Found existing character file`);
+      }
+
+      return { messageHistory, context, sessionId: session.id, characterFile };
     } catch (error) {
       console.error(`[ERROR] Exception in initializeSession:`, error);
       throw error;
@@ -96,9 +159,10 @@ export class ElizaGeneratorAgent {
    * @param userMessage The user's message
    * @param messageHistory Previous conversation history
    * @param context Relevant context from vector store
+   * @param characterFile Current character file
    * @returns Stream of reply chunks
    */
-  public async generateReply(sessionId: string, userMessage: string, messageHistory: string, context: string): Promise<IterableReadableStream<any>> {
+  public async generateReply(sessionId: string, userMessage: string, messageHistory: string, context: string, characterFile: any): Promise<IterableReadableStream<any>> {
     console.log(`[REPLY] Generating reply for session ${sessionId}`);
 
     console.log(messageHistory);
@@ -115,6 +179,7 @@ export class ElizaGeneratorAgent {
       {
         messageHistory: (input) => messageHistory,
         context: (input) => context,
+        characterFile: (input) => JSON.stringify(characterFile, null, 2),
         formatInstructions: (input) => replyParser.getFormatInstructions(),
       },
       elizaReplyGeneratorSystemPrompt,
@@ -123,7 +188,10 @@ export class ElizaGeneratorAgent {
     ]);
     
     console.log(`[REPLY] Reply chain created, starting stream`);
-    return replyChain.stream(userMessage);
+    const stream = await replyChain.stream(userMessage);
+    
+    // Add debug logging
+    return this.addStreamLogging(stream, '[REPLY_STREAM]');
   }
   
   /**
@@ -132,79 +200,130 @@ export class ElizaGeneratorAgent {
    * @param userMessage The user's message
    * @param messageHistory Previous conversation history
    * @param context Relevant context from vector store
+   * @param characterFile Current character file
    * @returns Stream of character file chunks
    */
-  public async generateCharacterFile(sessionId: string, userMessage: string, messageHistory: string, context: string): Promise<IterableReadableStream<any>> {
+  public async generateCharacterFile(sessionId: string, userMessage: string, messageHistory: string, context: string, characterFile: any): Promise<IterableReadableStream<any>> {
     console.log(`[CHARACTER] Generating character file for session ${sessionId}`);
     
     try {
       // Create a parser for the character file
       const parser = StructuredOutputParser.fromZodSchema(CharacterSchema);
       
-      // Create the character file chain
+      // Create an output fixing parser to handle potential parsing errors
+      const fixingParser = OutputFixingParser.fromLLM(
+        this.llm.getModel(),
+        parser
+      );
+      
+      // Create a JSON validator prompt
+      const jsonValidatorPrompt = ChatPromptTemplate.fromTemplate(`
+        You are a JSON validator and repair expert. Your task is to validate and fix the following JSON object 
+        to ensure it conforms to the required schema for a character file.
+        
+        Here is the JSON schema that the object should conform to:
+        {characterJsonSchema}
+        
+        Here is the JSON object to validate and fix:
+        {jsonObject}
+        
+        If the JSON is valid and conforms to the schema, return it unchanged.
+        If the JSON has syntax errors or doesn't conform to the schema, fix it and return the corrected version.
+        
+        Return ONLY the fixed JSON object, with no additional explanation or commentary.
+        The output must be valid JSON that can be parsed with JSON.parse().
+      `);
+      
+      // Create a JSON validator function
+      const validateJson = async (characterData: any) => {
+        console.log(`[CHARACTER] Validating JSON`);
+        const jsonString = JSON.stringify(characterData, null, 2);
+        
+        const jsonValidatorChain = RunnableSequence.from([
+          {
+            characterJsonSchema: () => characterJsonSchema,
+            jsonObject: () => jsonString
+          },
+          jsonValidatorPrompt,
+          this.llm.getModel(),
+          new StringOutputParser()
+        ]);
+        
+        console.log(`[CHARACTER] Running JSON validation chain`);
+        const validatedJsonString = await jsonValidatorChain.invoke({});
+        
+        try {
+          // Parse the validated JSON
+          const validatedJson = JSON.parse(validatedJsonString);
+          console.log(`[CHARACTER] JSON validation complete`);
+          return validatedJson;
+        } catch (parseError) {
+          console.error(`[CHARACTER] Failed to parse validated JSON: ${parseError}`);
+          // If we can't parse it, return the original
+          return characterData;
+        }
+      };
+      
+      // Create the character file chain with validation
       const characterChain = RunnableSequence.from([
         {
           messageHistory: (input) => messageHistory,
           context: (input) => context,
+          characterFile: (input) => JSON.stringify(characterFile, null, 2),
           characterJsonSchema: (input) => characterJsonSchema,
           formatInstructions: (input) => parser.getFormatInstructions(),
         },
         elizaCharacterGeneratorSystemPrompt,
         this.llm.getModel(),
-        parser
+        new StringOutputParser(),
+        {
+          characterJsonSchema: () => characterJsonSchema,
+          jsonObject: (output) => JSON.stringify(output, null, 2)
+        },
+        jsonValidatorPrompt,
+        this.llm.getModel(),
+        fixingParser
       ]);
       
-      console.log(`[CHARACTER] Character chain created, starting stream`);
-      return characterChain.stream(userMessage);
+      console.log(`[CHARACTER] Character chain created with validation, starting stream`);
+      const stream = await characterChain.stream(userMessage);
+      
+      // Add debug logging
+      return this.addStreamLogging(stream, '[CHARACTER_STREAM]');
     } catch (error) {
       console.error(`[CHARACTER] Error setting up character file generation:`, error);
       throw error;
     }
   }
-
-  // Process the stream in the background to log its contents
-  private async logStreamContents(stream: IterableReadableStream<any>): Promise<void> {
-    let chunkCount = 0;
-    let objectChunks = 0;
-    let stringChunks = 0;
-    let totalStringLength = 0;
+  
+  /**
+   * Add logging to a stream without consuming it
+   * @param stream The stream to add logging to
+   * @param prefix The prefix to use for log messages
+   * @returns The same stream with logging added
+   */
+  private addStreamLogging<T>(stream: IterableReadableStream<T>, prefix: string): IterableReadableStream<T> {
+    const controller = new TransformStream<T, T>();
+    const writer = controller.writable.getWriter();
     
-    try {
-      console.log(`[STREAM_BG] Starting to process stream chunks in background`);
-      
-      // Create a clone of the stream to process in the background
-      const streamClone = stream[Symbol.asyncIterator]();
-      
-      // Process each chunk
-      while (true) {
-        const { value, done } = await streamClone.next();
-        
-        if (done) {
-          break;
+    // Process the original stream, log chunks, and forward them
+    (async () => {
+      try {
+        let chunkCount = 0;
+        for await (const chunk of stream) {
+          chunkCount++;
+          console.log(`${prefix} Chunk #${chunkCount}:`, JSON.stringify(chunk));
+          await writer.write(chunk);
         }
-        
-        const chunk = value;
-        chunkCount++;
-        
-        if (typeof chunk === 'object') {
-          objectChunks++;
-          console.log(`[STREAM_BG] Chunk #${chunkCount} is an object:`, JSON.stringify(chunk));
-        } else {
-          stringChunks++;
-          totalStringLength += String(chunk).length;
-          console.log(`[STREAM_BG] Chunk #${chunkCount} is a string of length ${String(chunk).length}`);
-          if (String(chunk).length < 500) {
-            console.log(`[STREAM_BG] String content: "${String(chunk)}"`);
-          } else {
-            console.log(`[STREAM_BG] String content (truncated): "${String(chunk).substring(0, 200)}..."`);
-          }
-        }
+        console.log(`${prefix} Stream completed with ${chunkCount} chunks`);
+      } catch (error) {
+        console.error(`${prefix} Error processing stream:`, error);
+      } finally {
+        writer.close();
       }
-      
-      console.log(`[STREAM_BG] Stream completed. Total chunks: ${chunkCount} (${objectChunks} objects, ${stringChunks} strings, total string length: ${totalStringLength})`);
-    } catch (error) {
-      console.error(`[STREAM_BG] Error processing stream:`, error);
-    }
+    })();
+    
+    return controller.readable as unknown as IterableReadableStream<T>;
   }
 
   // Static factory method
